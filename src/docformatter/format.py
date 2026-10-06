@@ -164,6 +164,88 @@ def _is_multiline_parameter(tokens: list[tokenize.TokenInfo], index: int) -> boo
     return token.type == tokenize.STRING and token.start[0] != token.end[0]
 
 
+def _get_char_col_from_byte_col(text: str, byte_col: int) -> Union[int, None]:
+    """Return the character index in text at UTF-8 byte offset byte_col.
+
+    Parameters
+    ----------
+    text : str
+        The physical source line the offset refers to.
+    byte_col : int
+        A column expressed as a UTF-8 byte offset into text.
+
+    Returns
+    -------
+    int | None
+        The matching character index, or None when byte_col does not fall on a
+        character boundary of text.
+    """
+    _consumed = 0
+    for _idx, _char in enumerate(text):
+        if _consumed == byte_col:
+            return _idx
+        _consumed += len(_char.encode("utf-8"))
+
+    return len(text) if _consumed == byte_col else None
+
+
+def _do_normalize_token_columns(
+    tokens: list[tokenize.TokenInfo],
+) -> list[tokenize.TokenInfo]:
+    """Repair single-row tokens whose columns do not index their own text.
+
+    CPython 3.12.4 (python/cpython#120343) reports UTF-8 byte offsets instead of
+    character offsets for every token that follows a multiline token containing
+    non-ASCII text on the same row.  docformatter rebuilds the whitespace between
+    tokens from those columns, so a wrong column inserts a blank line or
+    duplicates characters on every run.
+
+    A column is changed only when the current slice of the line is not the token
+    string and the slice at the converted column is.  Tokens from a correct
+    tokenizer already satisfy the first check and are returned unchanged.
+
+    Parameters
+    ----------
+    tokens : list[tokenize.TokenInfo]
+        The tokens produced by tokenize.generate_tokens().
+
+    Returns
+    -------
+    list[tokenize.TokenInfo]
+        The tokens with any byte-based columns converted to character columns.
+    """
+    _fixed: list[tokenize.TokenInfo] = []
+
+    for _token in tokens:
+        if _token.start[0] != _token.end[0] or _token.type == tokenize.ENDMARKER:
+            _fixed.append(_token)
+            continue
+
+        _start_col, _end_col = _token.start[1], _token.end[1]
+        if _token.line[_start_col:_end_col] == _token.string:
+            _fixed.append(_token)
+            continue
+
+        _new_start = _get_char_col_from_byte_col(_token.line, _start_col)
+        if _new_start is None:
+            _fixed.append(_token)
+            continue
+
+        _new_end = _new_start + len(_token.string)
+        if _token.line[_new_start:_new_end] != _token.string:
+            _fixed.append(_token)
+            continue
+
+        _fixed.append(
+            _token._replace(
+                start=(_token.start[0], _new_start),
+                end=(_token.end[0], _new_end),
+            )
+        )
+
+    return _fixed
+
+
 def _do_update_token_indices(
     tokens: list[tokenize.TokenInfo],
 ) -> list[tokenize.TokenInfo]:
@@ -961,8 +1043,8 @@ class Formatter:
 
         try:
             _original_newline = self.encodor.do_find_newline(source.splitlines(True))
-            tokens = list(
-                tokenize.generate_tokens(io.StringIO(source, newline="").readline)
+            tokens = _do_normalize_token_columns(
+                list(tokenize.generate_tokens(io.StringIO(source, newline="").readline))
             )
 
             # Perform docstring rewriting

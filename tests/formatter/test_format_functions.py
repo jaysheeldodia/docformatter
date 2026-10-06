@@ -248,6 +248,117 @@ def test_get_newlines_by_type(test_key):
     assert result == expected, f"\nFailed {test_key}\nExpected {expected}\nGot {result}"
 
 
+@pytest.mark.unit
+def test_get_char_col_from_byte_col():
+    """Convert UTF-8 byte offsets to character indices, or None off-boundary."""
+    # "┘" is one character and three bytes.
+    text = 'a┘."""\n'
+
+    assert _format._get_char_col_from_byte_col(text, 0) == 0
+    assert _format._get_char_col_from_byte_col(text, 1) == 1
+    assert _format._get_char_col_from_byte_col(text, 4) == 2
+    assert _format._get_char_col_from_byte_col(text, 9) == len(text)
+    assert _format._get_char_col_from_byte_col(text, 2) is None
+    assert _format._get_char_col_from_byte_col(text, 99) is None
+
+
+@pytest.mark.unit
+def test_do_normalize_token_columns_fixes_newline_after_multibyte_string():
+    """Convert a byte-based NEWLINE column so no blank line is inserted.
+
+    Mirrors CPython 3.12.4 (python/cpython#120343): the docstring ends at
+    character column 30 but the NEWLINE that follows starts at byte column 32.
+    """
+    docstring = (
+        '"""Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+        '    aaaaaaaaaaaaaaaaaaaaa┘."""'
+    )
+    closing_line = '    aaaaaaaaaaaaaaaaaaaaa┘."""\n'
+    tokens = [
+        tokenize.TokenInfo(
+            tokenize.STRING, docstring, (2, 4), (3, 30), f"    {docstring}\n"
+        ),
+        tokenize.TokenInfo(tokenize.NEWLINE, "\n", (3, 32), (3, 33), closing_line),
+    ]
+
+    result = _format._do_normalize_token_columns(tokens)
+
+    assert result[0] == tokens[0]
+    assert result[1].start == (3, 30)
+    assert result[1].end == (3, 31)
+    assert result[1].string == "\n"
+
+
+@pytest.mark.unit
+def test_do_normalize_token_columns_fixes_comment_after_multibyte_string():
+    """Convert a byte-based COMMENT column so the comment is not duplicated."""
+    closing_line = '    Trailing ┘."""  # keep me\n'
+    comment_char_col = closing_line.index("#")
+    comment_byte_col = len(closing_line[:comment_char_col].encode("utf-8"))
+    assert comment_byte_col == comment_char_col + 2
+
+    tokens = [
+        tokenize.TokenInfo(
+            tokenize.COMMENT,
+            "# keep me",
+            (4, comment_byte_col),
+            (4, comment_byte_col + len("# keep me")),
+            closing_line,
+        ),
+    ]
+
+    result = _format._do_normalize_token_columns(tokens)
+
+    assert result[0].start == (4, comment_char_col)
+    assert result[0].end == (4, comment_char_col + len("# keep me"))
+
+
+@pytest.mark.unit
+def test_do_normalize_token_columns_is_noop_for_consistent_tokens():
+    """Tokens whose columns already index their text are returned unchanged.
+
+    Single-line non-ASCII is tokenized correctly on every supported Python, so
+    this input must come back identical everywhere.
+    """
+    source = 'x = "┘"  # c\nif True:\n    """Doc.\n\n    More.\n    """\n    y = 2\n'
+    tokens = list(tokenize.generate_tokens(StringIO(source).readline))
+
+    result = _format._do_normalize_token_columns(tokens)
+
+    assert result == tokens
+
+
+@pytest.mark.unit
+def test_do_normalize_token_columns_restores_invariant_for_real_tokens():
+    """Every single-row token indexes its own text after normalization.
+
+    On CPython 3.12.4 the tokenizer breaks this for the tokens after the
+    multiline string; elsewhere the input is already consistent.  Either way
+    the invariant must hold afterwards.
+    """
+    source = (
+        'def foo():\n    """Summary.\n\n    Trailing ┘."""  # keep me\n    return 1\n'
+    )
+    tokens = list(tokenize.generate_tokens(StringIO(source).readline))
+
+    result = _format._do_normalize_token_columns(tokens)
+
+    for token in result:
+        if token.start[0] == token.end[0] and token.type != tokenize.ENDMARKER:
+            assert token.line[token.start[1] : token.end[1]] == token.string
+
+
+@pytest.mark.unit
+def test_do_normalize_token_columns_leaves_unfixable_tokens_alone():
+    """A column that cannot be matched to the token text is left as it was."""
+    line = "x = 1\n"
+    bad = tokenize.TokenInfo(tokenize.NAME, "zzz", (1, 4), (1, 7), line)
+
+    result = _format._do_normalize_token_columns([bad])
+
+    assert result == [bad]
+
+
 @pytest.mark.integration
 @pytest.mark.order(4)
 @pytest.mark.parametrize(
